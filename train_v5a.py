@@ -1,5 +1,6 @@
 # ==============================================================================
 # COMPATIFI V5A - ASSISTANT OBJECTIVE MODEL (L40S OPTIMIZED)
+
 # ==============================================================================
 #
 # Continual-learning / multi-task QLoRA training
@@ -14,11 +15,12 @@
 # Hardware target:
 #   NVIDIA L40S (48GB VRAM)
 #
-# ==============================================================================
 
+# ==============================================================================
 
 # ==============================================================================
 # SECTION 1: IMPORTS
+
 # ==============================================================================
 
 import json
@@ -45,9 +47,9 @@ from transformers import (
     trainer_utils,
 )
 
-
 # ==============================================================================
 # SECTION 2: HARDWARE SETTINGS
+
 # ==============================================================================
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -70,9 +72,9 @@ print("=" * 70)
 print(GPU_NAME)
 print("=" * 70)
 
-
 # ==============================================================================
 # SECTION 3: CONFIGURATION
+
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -150,9 +152,9 @@ LORA_TARGET_MODULES = [
 
 SEED = 42
 
-
 # ==============================================================================
 # SECTION 4: REPRODUCIBILITY
+
 # ==============================================================================
 
 random.seed(SEED)
@@ -162,9 +164,9 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-
 # ==============================================================================
 # SECTION 5: COMPUTE DTYPE
+
 # ==============================================================================
 
 if torch.cuda.is_bf16_supported():
@@ -185,9 +187,9 @@ print(f"BF16          : {USE_BF16}")
 print(f"FP16          : {USE_FP16}")
 print("=" * 70)
 
-
 # ==============================================================================
 # SECTION 6: V5A MULTI-TASK SYSTEM PROMPT
+
 # ==============================================================================
 
 SYSTEM_PROMPT = """
@@ -229,9 +231,9 @@ Do not invent information.
 Return only the requested structured output.
 """
 
-
 # ==============================================================================
 # SECTION 7: TOKENIZER
+
 # ==============================================================================
 
 print("=" * 70)
@@ -248,9 +250,9 @@ if tokenizer.pad_token is None:
 
 tokenizer.padding_side = "right"
 
-
 # ==============================================================================
 # SECTION 8: MODEL - 4-BIT QLoRA
+
 # ==============================================================================
 
 print("=" * 70)
@@ -277,9 +279,9 @@ model = AutoModelForCausalLM.from_pretrained(
 model.config.use_cache = False
 model = prepare_model_for_kbit_training(model)
 
-
 # ==============================================================================
 # SECTION 9: LoRA CONFIGURATION
+
 # ==============================================================================
 
 peft_config = LoraConfig(
@@ -291,9 +293,9 @@ peft_config = LoraConfig(
     target_modules=LORA_TARGET_MODULES,
 )
 
-
 # ==============================================================================
 # SECTION 10: DATASET VALIDATION
+
 # ==============================================================================
 
 def validate_jsonl(path):
@@ -342,18 +344,18 @@ def validate_jsonl(path):
 
     return valid
 
-
 # ==============================================================================
 # SECTION 11: VALIDATE ALL DATASETS
+
 # ==============================================================================
 
 v5a_count = validate_jsonl(V5A_DATASET_PATH)
 v4a_count = validate_jsonl(V4A_REPLAY_PATH)
 v4b_count = validate_jsonl(V4B_REPLAY_PATH)
 
-
 # ==============================================================================
 # SECTION 12: LOAD DATASETS
+
 # ==============================================================================
 
 print()
@@ -369,9 +371,9 @@ print(f"V5A available : {len(v5a_dataset)}")
 print(f"V4A available : {len(v4a_dataset)}")
 print(f"V4B available : {len(v4b_dataset)}")
 
-
 # ==============================================================================
 # SECTION 13: SHUFFLE + SELECT REPLAY
+
 # ==============================================================================
 
 v5a_dataset = v5a_dataset.shuffle(seed=SEED)
@@ -386,9 +388,9 @@ v5a_dataset = v5a_dataset.select(range(v5a_take))
 v4a_dataset = v4a_dataset.select(range(v4a_take))
 v4b_dataset = v4b_dataset.select(range(v4b_take))
 
-
 # ==============================================================================
 # SECTION 14: ADD TASK LABEL
+
 # ==============================================================================
 
 def identify_task(example):
@@ -411,9 +413,9 @@ v5a_dataset = v5a_dataset.map(identify_task)
 v4a_dataset = v4a_dataset.map(identify_task)
 v4b_dataset = v4b_dataset.map(identify_task)
 
-
 # ==============================================================================
 # SECTION 15: CHECK TASK IDENTITY
+
 # ==============================================================================
 
 def check_task(dataset, expected_task):
@@ -433,9 +435,9 @@ check_task(v5a_dataset, "V5A")
 check_task(v4a_dataset, "V4A")
 check_task(v4b_dataset, "V4B")
 
-
 # ==============================================================================
 # SECTION 16: COMBINE DATASETS
+
 # ==============================================================================
 
 print()
@@ -468,9 +470,9 @@ if replay_percentage > 15:
 if replay_percentage < 2:
     print("\nWARNING: Replay is below 2%.")
 
-
 # ==============================================================================
 # SECTION 17: FORMAT SAMPLE
+
 # ==============================================================================
 
 def format_sample(example):
@@ -504,9 +506,9 @@ def format_sample(example):
 
     return {"text": formatted_text}
 
-
 # ==============================================================================
 # SECTION 18: CACHE FORMATTED DATASET
+
 # ==============================================================================
 
 if os.path.exists(CACHE_DIR):
@@ -529,9 +531,9 @@ else:
     print(f"Caching formatted dataset to: {CACHE_DIR}")
     formatted_dataset.save_to_disk(CACHE_DIR)
 
-
 # ==============================================================================
 # SECTION 19: DATASET STATISTICS
+
 # ==============================================================================
 
 stats_file = os.path.join(CACHE_DIR, "stats.json")
@@ -573,9 +575,9 @@ print(f"Maximum Token Length : {stats['max_length']}")
 print(f"Minimum Token Length : {stats['min_length']}")
 print("=" * 70)
 
-
 # ==============================================================================
 # SECTION 20: TRAIN / VALIDATION SPLIT
+
 # ==============================================================================
 
 print()
@@ -590,9 +592,9 @@ eval_dataset = split_dataset["test"]
 print(f"Training samples   : {len(train_dataset)}")
 print(f"Validation samples : {len(eval_dataset)}")
 
-
 # ==============================================================================
 # SECTION 21: TRAINING CONFIGURATION
+
 # ==============================================================================
 
 training_args = SFTConfig(
@@ -638,12 +640,12 @@ training_args = SFTConfig(
 
     disable_tqdm=False,
     seed=SEED,
-    remove_unused_columns=False,
+    remove_unused_columns=True,
 )
-
 
 # ==============================================================================
 # SECTION 22: TRAINER
+
 # ==============================================================================
 
 trainer = SFTTrainer(
@@ -655,9 +657,9 @@ trainer = SFTTrainer(
     processing_class=tokenizer,
 )
 
-
 # ==============================================================================
 # SECTION 23: CHECKPOINT RESUME
+
 # ==============================================================================
 
 print()
@@ -675,9 +677,9 @@ if last_checkpoint:
 else:
     print("No checkpoint found.\nStarting a fresh V5A training run.")
 
-
 # ==============================================================================
 # SECTION 24: TRAIN
+
 # ==============================================================================
 
 print()
@@ -701,9 +703,9 @@ print("\n" + "=" * 70)
 
 trainer.train(resume_from_checkpoint=last_checkpoint)
 
-
 # ==============================================================================
 # SECTION 25: SAVE FINAL MODEL
+
 # ==============================================================================
 
 FINAL_MODEL_DIR = os.path.join(OUTPUT_DIR, "final_model")
@@ -722,3 +724,7 @@ print("V5A TRAINING COMPLETE")
 print("=" * 70)
 print(f"Final model:\n{FINAL_MODEL_DIR}")
 print("=" * 70)
+
+# trainer.train(
+#     resume_from_checkpoint="./v5a_checkpoints/checkpoint-7956"
+# )
