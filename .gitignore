@@ -9,3 +9,10 @@ v5a_normalized_training.jsonl
 v5b_normalized_training.jsonl
 v5b_full_checkpointsv5b_normalized_training.jsonl
 v5b_full_checkpoints
+V5C_Final_Merged_Model
+V5C_Final
+V5D_Final_Merged_Model
+V5D_Final
+v5c_benchmark_results.json
+v5c_normalized_training.jsonl
+v5d_normalized_training.jsonl

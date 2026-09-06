@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
 
 # ============================================================
-# Compatifi V5A Training
-# Assistant Objective Prediction
+# COMPATIFI V5C TRAINING
+# Conversation Summary Model
 #
-# V5A DATASET ONLY
+# PIPELINE:
+#
+# V4B -> V5A -> V5B -> V5C
+#
+# V5C DATASET ONLY
 # No replay dataset
-# No strict label validation
-# No objective-label rejection
+# No V4/V5A/V5B dataset replay
 #
+# HARDWARE:
+# RTX 3060 12GB
+#
+# TRAINING:
+# QLoRA 4-bit
+# TRL SFTTrainer
+# Same training architecture as V5A/V5B
+#
+# IMPORTANT:
+# V5C starts from the MERGED V5B model.
 # ============================================================
 
 
 # ============================================================
-# SECTION 1: IMPORTS
+# 1. IMPORTS
 # ============================================================
 
 import json
@@ -43,7 +56,7 @@ from transformers import (
 
 
 # ============================================================
-# SECTION 2: GPU SETTINGS
+# 2. GPU SETTINGS
 # ============================================================
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -59,7 +72,7 @@ if not torch.cuda.is_available():
 
 
 print("=" * 80)
-print("COMPATIFI V5A TRAINING")
+print("COMPATIFI V5C TRAINING")
 print("=" * 80)
 
 print()
@@ -82,65 +95,117 @@ print()
 
 
 # ============================================================
-# SECTION 3: CONFIGURATION
+# 3. PATHS
 # ============================================================
 
-BASE_CHECKPOINT = "../V4B_Final_Merged_Model"
+# IMPORTANT:
+# This MUST be the correctly merged V5B model.
 
-# ONLY training dataset
-V5A_DATASET = "./v5a_main.jsonl"
+BASE_CHECKPOINT = (
+    r"E:\Compatifi-Model\V5B_Final_Merged_Model"
+)
 
-# Normalized temporary V5A dataset
-NORMALIZED_DATASET = "./v5a_normalized_training.jsonl"
 
-# Final checkpoints
-OUTPUT_DIR = "./v5a_full_checkpoints"
+# ONLY V5C DATASET
+
+V5C_DATASET = (
+    r".\datasets\V5C\V5C.jsonl"
+)
+
+
+# Temporary normalized dataset
+
+NORMALIZED_DATASET = (
+    r".\v5c_normalized_training.jsonl"
+)
+
+
+# V5C checkpoints
+
+OUTPUT_DIR = (
+    r".\V5C_Final"
+)
 
 
 # ============================================================
-# SYSTEM PROMPT
+# 4. SYSTEM PROMPT
 # ============================================================
 
-SYSTEM_PROMPT = """You are Compatifi V5A.
+SYSTEM_PROMPT = """You are Compatifi V5C.
 
-Your task is to predict the assistant objective for the current
-conversation.
+Your task is to summarize the current relationship conversation.
 
-Use the information provided in:
+Generate ONE concise, factual summary.
 
-- Domain
-- Relationship
-- Conversation
+Use only information supported by the conversation.
 
-Determine what the assistant should accomplish next.
+Focus on:
+- the main topic
+- important facts
+- the user's current situation
+- the user's goal when relevant
+- important problems or obstacles
+- important outcomes when relevant
 
-Return ONLY the JSON object from the training example.
+Do not:
+- generate a reply
+- give advice
+- provide coaching
+- calculate compatibility
+- create a user profile
+- create a people profile
+- extract long-term memories
+- invent information
+- add unsupported assumptions
+- add opinions
+- include unnecessary details
 
-Do not add explanations outside the JSON object.
+If information is unknown, do not invent it.
+
+Return only the summary.
 """
 
 
 # ============================================================
-# SECTION 4: TRAINING PARAMETERS
+# 5. TRAINING PARAMETERS
 # ============================================================
 
 MAX_SEQ_LENGTH = 1024
 
-PER_DEVICE_BATCH_SIZE = 4
 
-GRADIENT_ACCUMULATION_STEPS = 4
+# RTX 3060 12GB
 
-LEARNING_RATE = 2e-4
+PER_DEVICE_BATCH_SIZE = 1
+
+GRADIENT_ACCUMULATION_STEPS = 16
+
+
+# IMPORTANT:
+# Lower than V5A/V5B to reduce aggressive specialization.
+
+LEARNING_RATE = 5e-5
+
+
+# Start with 1 epoch.
+#
+# With 75k samples this is already a large amount
+# of training for a specialized V5C task.
 
 NUM_TRAIN_EPOCHS = 2
 
-SAVE_STEPS = 500
+
+WARMUP_RATIO = 0.05
+
+
+SAVE_STEPS = 150
 
 LOGGING_STEPS = 10
 
+SAVE_TOTAL_LIMIT = 2
+
 
 # ============================================================
-# SECTION 5: LoRA CONFIGURATION
+# 6. LoRA CONFIGURATION
 # ============================================================
 
 LORA_R = 16
@@ -165,7 +230,7 @@ LORA_TARGET_MODULES = [
 
 
 # ============================================================
-# SECTION 6: PRECISION
+# 7. PRECISION
 # ============================================================
 
 if torch.cuda.is_bf16_supported():
@@ -194,7 +259,7 @@ print()
 
 
 # ============================================================
-# SECTION 7: CHECK FILES
+# 8. CHECK FILES
 # ============================================================
 
 print("=" * 80)
@@ -204,23 +269,18 @@ print("=" * 80)
 print()
 
 print(
-    "Base checkpoint :",
-    BASE_CHECKPOINT
+    "V5B base model:",
+    os.path.abspath(BASE_CHECKPOINT)
 )
 
 print(
-    "V5A dataset     :",
-    V5A_DATASET
-)
-
-print(
-    "Normalized data :",
-    NORMALIZED_DATASET
+    "V5C dataset:",
+    os.path.abspath(V5C_DATASET)
 )
 
 print(
     "Output directory:",
-    OUTPUT_DIR
+    os.path.abspath(OUTPUT_DIR)
 )
 
 print()
@@ -228,51 +288,71 @@ print()
 
 if not os.path.isdir(BASE_CHECKPOINT):
 
-    print("ERROR: Base checkpoint not found.")
-
-    print()
-
-    print(
-        "Expected:",
-        BASE_CHECKPOINT
+    raise FileNotFoundError(
+        "\nV5B merged model was not found:\n"
+        + os.path.abspath(BASE_CHECKPOINT)
     )
 
-    print()
 
-    print(
-        "Current working directory:",
-        os.getcwd()
+if not os.path.isfile(V5C_DATASET):
+
+    raise FileNotFoundError(
+        "\nV5C dataset was not found:\n"
+        + os.path.abspath(V5C_DATASET)
     )
 
-    sys.exit(1)
+
+# ============================================================
+# 9. VERIFY THAT V5B IS A MERGED MODEL
+# ============================================================
+
+print("=" * 80)
+print("CHECKING V5B MODEL")
+print("=" * 80)
+
+print()
 
 
-if not os.path.isfile(V5A_DATASET):
+v5b_adapter_config = os.path.join(
+    BASE_CHECKPOINT,
+    "adapter_config.json"
+)
 
-    print("ERROR: V5A dataset not found.")
 
-    print()
+if os.path.exists(v5b_adapter_config):
 
     print(
-        "Expected:",
-        V5A_DATASET
+        "WARNING:"
     )
 
-    sys.exit(1)
+    print(
+        "adapter_config.json exists in the V5B directory."
+    )
 
+    print(
+        "Make sure this directory is your MERGED V5B model."
+    )
 
-print("Base checkpoint: OK")
-print("V5A dataset    : OK")
+    print(
+        "Do not accidentally use the V5B LoRA adapter directory."
+    )
+
+else:
+
+    print(
+        "V5B appears to be a normal/merged model directory."
+    )
+
 
 print()
 
 
 # ============================================================
-# SECTION 8: TOKENIZER
+# 10. LOAD TOKENIZER
 # ============================================================
 
 print("=" * 80)
-print("LOADING TOKENIZER")
+print("LOADING V5B TOKENIZER")
 print("=" * 80)
 
 print()
@@ -301,16 +381,18 @@ print()
 
 
 # ============================================================
-# SECTION 9: MODEL
+# 11. LOAD V5B MODEL
 # ============================================================
 
 print("=" * 80)
-print("LOADING MODEL")
+print("LOADING V5B MODEL")
 print("=" * 80)
 
 print()
 
-print("Loading model with 4-bit QLoRA...")
+print(
+    "Loading V5B with 4-bit QLoRA..."
+)
 
 
 bnb_config = BitsAndBytesConfig(
@@ -352,14 +434,23 @@ model = prepare_model_for_kbit_training(
 )
 
 
-print("Model loaded.")
+print()
+
+print("V5B model loaded.")
 
 print()
 
 
 # ============================================================
-# SECTION 10: LoRA
+# 12. LoRA
 # ============================================================
+
+print("=" * 80)
+print("CONFIGURING V5C LoRA")
+print("=" * 80)
+
+print()
+
 
 peft_config = LoraConfig(
 
@@ -378,73 +469,196 @@ peft_config = LoraConfig(
 )
 
 
+print(
+    "LoRA rank:",
+    LORA_R
+)
+
+print(
+    "LoRA alpha:",
+    LORA_ALPHA
+)
+
+print()
+
+
 # ============================================================
-# SECTION 11: FORMAT ONE SAMPLE
+# 13. LOAD V5C DATASET
+# ============================================================
+
+print("=" * 80)
+print("LOADING V5C DATASET")
+print("=" * 80)
+
+print()
+
+
+raw_dataset = Dataset.from_json(
+    V5C_DATASET
+)
+
+
+print(
+    f"V5C samples: {len(raw_dataset):,}"
+)
+
+print()
+
+
+if len(raw_dataset) == 0:
+
+    raise ValueError(
+        "V5C dataset is empty."
+    )
+
+
+# ============================================================
+# 14. VALIDATE DATASET
+# ============================================================
+
+print("=" * 80)
+print("VALIDATING V5C DATASET")
+print("=" * 80)
+
+print()
+
+
+for index, example in enumerate(
+    raw_dataset.select(
+        range(min(100, len(raw_dataset))
+    ))
+):
+
+    if "input" not in example:
+
+        raise ValueError(
+            f"Example {index + 1} missing 'input'."
+        )
+
+
+    if "output" not in example:
+
+        raise ValueError(
+            f"Example {index + 1} missing 'output'."
+        )
+
+
+    input_data = example["input"]
+
+    output_data = example["output"]
+
+
+    if "relationship" not in input_data:
+
+        raise ValueError(
+            f"Example {index + 1} missing "
+            "'input.relationship'."
+        )
+
+
+    if "conversation" not in input_data:
+
+        raise ValueError(
+            f"Example {index + 1} missing "
+            "'input.conversation'."
+        )
+
+
+    if "summary" not in output_data:
+
+        raise ValueError(
+            f"Example {index + 1} missing "
+            "'output.summary'."
+        )
+
+
+print(
+    "Dataset validation passed."
+)
+
+print()
+
+
+# ============================================================
+# 15. FORMAT SAMPLE
 # ============================================================
 
 def format_sample(example):
 
-    inp = example.get(
+    input_data = example.get(
         "input",
         {}
     )
 
 
-    domain = inp.get(
-        "domain",
-        ""
-    )
+    relationship = str(
+        input_data.get(
+            "relationship",
+            ""
+        )
+    ).strip()
 
 
-    relationship = inp.get(
-        "relationship",
-        ""
-    )
+    conversation = str(
+        input_data.get(
+            "conversation",
+            ""
+        )
+    ).strip()
 
 
-    conversation = inp.get(
-        "conversation",
-        ""
-    )
+    instruction = str(
+        example.get(
+            "instruction",
+            "Summarize the conversation."
+        )
+    ).strip()
 
 
-    instruction = example.get(
-        "instruction",
-        "Predict the assistant objective"
-    )
-
-
-    output = example.get(
+    output_data = example.get(
         "output",
         {}
     )
 
 
+    summary = str(
+        output_data.get(
+            "summary",
+            ""
+        )
+    ).strip()
+
+
+    # --------------------------------------------------------
+    # USER INPUT
+    # --------------------------------------------------------
+
     user_content = (
 
-        f"Domain: {domain}\n\n"
+        "Relationship:\n"
+        + relationship
+        + "\n\n"
 
-        f"Relationship: {relationship}\n\n"
+        "Conversation:\n"
+        + conversation
+        + "\n\n"
 
-        f"Conversation:\n"
-        f"{conversation}\n\n"
-
-        f"Instruction:\n"
-        f"{instruction}"
-
-    )
-
-
-    assistant_content = json.dumps(
-
-        output,
-
-        ensure_ascii=False,
-
-        separators=(",", ":"),
+        "Instruction:\n"
+        + instruction
 
     )
 
+
+    # --------------------------------------------------------
+    # ASSISTANT OUTPUT
+    # --------------------------------------------------------
+
+    assistant_content = summary
+
+
+    # --------------------------------------------------------
+    # CHAT FORMAT
+    # --------------------------------------------------------
 
     messages = [
 
@@ -478,39 +692,18 @@ def format_sample(example):
 
 
     return {
+
         "text": formatted_text
+
     }
 
 
 # ============================================================
-# SECTION 12: LOAD V5A DATASET
+# 16. FORMAT DATASET
 # ============================================================
 
 print("=" * 80)
-print("LOADING V5A DATASET")
-print("=" * 80)
-
-print()
-
-
-raw_dataset = Dataset.from_json(
-    V5A_DATASET
-)
-
-
-print(
-    f"V5A samples: {len(raw_dataset):,}"
-)
-
-print()
-
-
-# ============================================================
-# SECTION 13: CREATE NORMALIZED TEMPORARY DATASET
-# ============================================================
-
-print("=" * 80)
-print("CREATING NORMALIZED V5A DATASET")
+print("FORMATTING V5C DATASET")
 print("=" * 80)
 
 print()
@@ -522,7 +715,7 @@ formatted_dataset = raw_dataset.map(
 
     remove_columns=raw_dataset.column_names,
 
-    desc="Formatting V5A dataset",
+    desc="Formatting V5C dataset",
 
 )
 
@@ -535,46 +728,58 @@ print(
 print()
 
 
-# ------------------------------------------------------------
-# Save temporary normalized JSONL
-# ------------------------------------------------------------
+# ============================================================
+# 17. SAVE NORMALIZED DATASET
+# ============================================================
 
-print(
-    "Saving:",
-    NORMALIZED_DATASET
-)
+print("=" * 80)
+print("SAVING NORMALIZED DATASET")
+print("=" * 80)
+
+print()
 
 
 with open(
+
     NORMALIZED_DATASET,
+
     "w",
+
     encoding="utf-8",
+
 ) as f:
 
-    for item in formatted_dataset:
+    for example in formatted_dataset:
 
         f.write(
+
             json.dumps(
-                item,
+
+                example,
+
                 ensure_ascii=False,
+
             )
+
             + "\n"
+
         )
 
 
 print(
-    "Normalized dataset saved."
+    "Saved:",
+    os.path.abspath(NORMALIZED_DATASET)
 )
 
 print()
 
 
 # ============================================================
-# SECTION 14: DATASET STATISTICS
+# 18. DATASET STATISTICS
 # ============================================================
 
 print("=" * 80)
-print("DATASET STATISTICS")
+print("V5C DATASET STATISTICS")
 print("=" * 80)
 
 print()
@@ -591,27 +796,38 @@ sample_size = min(
 )
 
 
-lengths = []
+token_lengths = []
 
 
 for i in range(sample_size):
 
     text = formatted_dataset[i]["text"]
 
-    length = len(
-        tokenizer.encode(text)
+
+    tokens = tokenizer.encode(
+        text,
+        add_special_tokens=False
     )
 
-    lengths.append(length)
+
+    token_lengths.append(
+        len(tokens)
+    )
 
 
-if lengths:
+if token_lengths:
 
     average_length = (
-        sum(lengths) / len(lengths)
+
+        sum(token_lengths)
+        /
+        len(token_lengths)
+
     )
 
-    maximum_length = max(lengths)
+    maximum_length = max(
+        token_lengths
+    )
 
 else:
 
@@ -640,11 +856,11 @@ print()
 
 
 # ============================================================
-# SECTION 15: TRAINING CONFIG
+# 19. TRAINING CONFIGURATION
 # ============================================================
 
 print("=" * 80)
-print("CREATING TRAINING CONFIGURATION")
+print("CREATING V5C TRAINING CONFIGURATION")
 print("=" * 80)
 
 print()
@@ -656,19 +872,18 @@ training_args = SFTConfig(
 
 
     # --------------------------------------------------------
-    # Batch
+    # BATCH
     # --------------------------------------------------------
 
     per_device_train_batch_size=
         PER_DEVICE_BATCH_SIZE,
-
 
     gradient_accumulation_steps=
         GRADIENT_ACCUMULATION_STEPS,
 
 
     # --------------------------------------------------------
-    # Sequence
+    # SEQUENCE
     # --------------------------------------------------------
 
     max_seq_length=MAX_SEQ_LENGTH,
@@ -679,7 +894,7 @@ training_args = SFTConfig(
 
 
     # --------------------------------------------------------
-    # Learning
+    # LEARNING
     # --------------------------------------------------------
 
     learning_rate=LEARNING_RATE,
@@ -688,18 +903,18 @@ training_args = SFTConfig(
 
     lr_scheduler_type="cosine",
 
-    warmup_ratio=0.03,
+    warmup_ratio=WARMUP_RATIO,
 
 
     # --------------------------------------------------------
-    # Optimizer
+    # OPTIMIZER
     # --------------------------------------------------------
 
     optim="paged_adamw_8bit",
 
 
     # --------------------------------------------------------
-    # Precision
+    # PRECISION
     # --------------------------------------------------------
 
     bf16=USE_BF16,
@@ -710,32 +925,32 @@ training_args = SFTConfig(
 
 
     # --------------------------------------------------------
-    # Gradient checkpointing
+    # GRADIENT CHECKPOINTING
     # --------------------------------------------------------
 
     gradient_checkpointing=True,
 
 
     # --------------------------------------------------------
-    # Logging
+    # LOGGING
     # --------------------------------------------------------
 
     logging_steps=LOGGING_STEPS,
 
 
     # --------------------------------------------------------
-    # Checkpoints
+    # CHECKPOINTS
     # --------------------------------------------------------
 
     save_strategy="steps",
 
     save_steps=SAVE_STEPS,
 
-    save_total_limit=2,
+    save_total_limit=SAVE_TOTAL_LIMIT,
 
 
     # --------------------------------------------------------
-    # Misc
+    # MISC
     # --------------------------------------------------------
 
     report_to="none",
@@ -746,8 +961,15 @@ training_args = SFTConfig(
 
 
 # ============================================================
-# SECTION 16: TRAINER
+# 20. CREATE TRAINER
 # ============================================================
+
+print("=" * 80)
+print("CREATING V5C SFT TRAINER")
+print("=" * 80)
+
+print()
+
 
 trainer = SFTTrainer(
 
@@ -764,12 +986,34 @@ trainer = SFTTrainer(
 )
 
 
+print(
+    "V5C SFTTrainer created."
+)
+
+print()
+
+
 # ============================================================
-# SECTION 17: RESUME CHECK
+# 21. TRAINABLE PARAMETERS
 # ============================================================
 
 print("=" * 80)
-print("CHECKING FOR EXISTING CHECKPOINT")
+print("TRAINABLE PARAMETERS")
+print("=" * 80)
+
+print()
+
+trainer.model.print_trainable_parameters()
+
+print()
+
+
+# ============================================================
+# 22. CHECK FOR CHECKPOINT
+# ============================================================
+
+print("=" * 80)
+print("CHECKING FOR EXISTING V5C CHECKPOINT")
 print("=" * 80)
 
 print()
@@ -780,8 +1024,10 @@ last_checkpoint = None
 
 if os.path.isdir(OUTPUT_DIR):
 
-    last_checkpoint = trainer_utils.get_last_checkpoint(
-        OUTPUT_DIR
+    last_checkpoint = (
+        trainer_utils.get_last_checkpoint(
+            OUTPUT_DIR
+        )
     )
 
 
@@ -792,7 +1038,9 @@ if last_checkpoint:
     )
 
     print(
-        last_checkpoint
+        os.path.abspath(
+            last_checkpoint
+        )
     )
 
     print()
@@ -808,7 +1056,7 @@ else:
     )
 
     print(
-        "Starting fresh V5A training."
+        "Starting fresh V5C training from V5B."
     )
 
 
@@ -816,64 +1064,100 @@ print()
 
 
 # ============================================================
-# SECTION 18: TRAIN
+# 23. FINAL TRAINING CONFIG DISPLAY
 # ============================================================
 
 print("=" * 80)
-print("STARTING V5A TRAINING")
+print("V5C TRAINING CONFIGURATION")
 print("=" * 80)
 
 print()
 
 print(
-    "Base checkpoint :",
+    "Base model       :",
     BASE_CHECKPOINT
 )
 
 print(
-    "Training data   :",
-    V5A_DATASET
+    "Training dataset :",
+    V5C_DATASET
 )
 
 print(
-    "Replay data     : NONE"
-)
-
-print(
-    "Training samples:",
+    "Training samples  :",
     f"{len(formatted_dataset):,}"
 )
 
 print(
-    "Epochs          :",
+    "Epochs            :",
     NUM_TRAIN_EPOCHS
 )
 
 print(
-    "Batch size      :",
+    "Batch size        :",
     PER_DEVICE_BATCH_SIZE
 )
 
 print(
-    "Gradient accum. :",
+    "Gradient accum.   :",
     GRADIENT_ACCUMULATION_STEPS
 )
 
 print(
-    "Learning rate   :",
+    "Learning rate     :",
     LEARNING_RATE
+)
+
+print(
+    "Max sequence      :",
+    MAX_SEQ_LENGTH
+)
+
+print(
+    "Save steps        :",
+    SAVE_STEPS
+)
+
+print()
+
+print(
+    "Replay dataset    : NONE"
+)
+
+print(
+    "V4/V5A/V5B data   : NONE"
 )
 
 print()
 
 
-trainer.train(
-    resume_from_checkpoint=last_checkpoint
-)
+# ============================================================
+# 24. START TRAINING
+# ============================================================
+
+print("=" * 80)
+print("STARTING V5C TRAINING")
+print("=" * 80)
+
+print()
+
+
+if last_checkpoint:
+
+    trainer.train(
+
+        resume_from_checkpoint=
+            last_checkpoint
+
+    )
+
+else:
+
+    trainer.train()
 
 
 # ============================================================
-# SECTION 19: SAVE FINAL MODEL
+# 25. SAVE FINAL V5C
 # ============================================================
 
 FINAL_MODEL_DIR = os.path.join(
@@ -886,22 +1170,86 @@ FINAL_MODEL_DIR = os.path.join(
 
 
 print()
+
 print("=" * 80)
-print("SAVING FINAL V5A MODEL")
+print("SAVING FINAL V5C MODEL")
 print("=" * 80)
 
 print()
 
 
 trainer.save_model(
+
     FINAL_MODEL_DIR
+
 )
 
 
 tokenizer.save_pretrained(
+
     FINAL_MODEL_DIR
+
 )
 
+
+print()
+
+print(
+    "Final V5C model:"
+)
+
+print(
+    os.path.abspath(
+        FINAL_MODEL_DIR
+    )
+)
+
+print()
+
+
+# ============================================================
+# 26. COMPLETE
+# ============================================================
+
+print("=" * 80)
+print("V5C TRAINING COMPLETE")
+print("=" * 80)
+
+print()
+
+print(
+    "Pipeline:"
+)
+
+print(
+    "V4B -> V5A -> V5B -> V5C"
+)
+
+print()
+
+print(
+    "V5C task:"
+)
+
+print(
+    "Conversation -> concise factual summary"
+)
+
+print()
+
+print(
+    "Training dataset:"
+)
+
+print(
+    V5C_DATASET
+)
+
+print()
+
+print(
+    "Replay dataset: NONE"
+)
 
 print()
 
@@ -910,39 +1258,10 @@ print(
 )
 
 print(
-    FINAL_MODEL_DIR
+    os.path.abspath(
+        FINAL_MODEL_DIR
+    )
 )
-
-
-# ============================================================
-# SECTION 20: COMPLETE
-# ============================================================
-
-print()
-print("=" * 80)
-print("V5A TRAINING COMPLETE")
-print("=" * 80)
-
-print()
-
-print(
-    "Training dataset:",
-    V5A_DATASET
-)
-
-print(
-    "Temporary dataset:",
-    NORMALIZED_DATASET
-)
-
-print(
-    "Final checkpoint:",
-    FINAL_MODEL_DIR
-)
-
-print()
-
-print("Replay dataset: NONE")
 
 print()
 
