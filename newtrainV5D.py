@@ -1,930 +1,771 @@
-# =============================================================================
-# COMPATIFI V5D — BALANCED CONTINUAL LEARNING
-# NVIDIA L40S 48GB OPTIMIZED
-#
-# Pipeline:
-# V5A → V5B → V5C → V5C Final Merged Base → V5D QLoRA → V5D Adapter
-#
-# Goal:
-# Learn V5D Conversation Understanding while minimizing drift from
-# previously acquired V5A/V5B/V5C capabilities.
-# =============================================================================
+#!/usr/bin/env python3
 
-import os
+# ============================================================
+# COMPATIFI V5D TRAINING
+# Conversation Understanding Model
+#
+# PIPELINE:
+# V4B -> V5A -> V5B -> V5C -> V5D
+#
+# IMPORTANT CONTINUAL LEARNING DESIGN:
+# V5D starts from the correctly MERGED V5C model.
+# Uses the same proven SFTTrainer + QLoRA architecture as V5B/V5C.
+#
+# V5D DATASET ONLY - No replay dataset.
+# ============================================================
+
 import json
-import random
+import os
+import sys
 
 import torch
 from datasets import Dataset
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-)
+
+from peft import LoraConfig, prepare_model_for_kbit_training
+from trl import SFTConfig, SFTTrainer
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    DataCollatorForSeq2Seq,
-    EarlyStoppingCallback,
-    Trainer,
-    TrainingArguments,
+    trainer_utils,
 )
-from transformers.trainer_utils import get_last_checkpoint
 
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+# ============================================================
+# 1. GPU SETTINGS
+# ============================================================
 
-# Paths
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+if not torch.cuda.is_available():
+    print("ERROR: CUDA is not available.")
+    sys.exit(1)
+
+print("=" * 80)
+print("COMPATIFI V5D TRAINING")
+print("=" * 80)
+print()
+
+print("GPU:", torch.cuda.get_device_name(0))
+
+gpu_memory = (
+    torch.cuda.get_device_properties(0).total_memory
+    / (1024 ** 3)
+)
+
+print(f"GPU Memory: {gpu_memory:.1f} GB")
+print()
+
+
+# ============================================================
+# 2. PATHS
+# ============================================================
+
+# MUST be the correctly merged V5C model.
+# Do NOT use a V5C LoRA adapter directory.
+
 BASE_CHECKPOINT = "./V5C_Final_Merged_Model"
+
+# V5D dataset
 V5D_DATASET = "./datasets/V5D/V5D.jsonl"
+
+# Normalized dataset output
+NORMALIZED_DATASET = "./v5d_normalized_training.jsonl"
+
+# Training output
 OUTPUT_DIR = "./V5D_Final"
-FINAL_MODEL_DIR = os.path.join(OUTPUT_DIR, "final_model")
-NORMALIZED_DATASET = os.path.join(
-    OUTPUT_DIR,
-    "v5d_normalized_training.jsonl",
-)
 
-# Reproducibility
-SEED = 42
 
-# L40S / Sequence Configuration
+# ============================================================
+# 3. SYSTEM PROMPT
+# ============================================================
+
+SYSTEM_PROMPT = """You are Compatifi V5D.
+
+Your task is to understand the current state of a conversation
+and extract structured information from the provided context.
+
+Analyze only the information explicitly supported by the
+conversation and input context.
+
+Identify:
+- the main topic
+- the user's current situation
+- the user's current goal
+- the user's current issue or obstacle
+- the current conversation stage
+- the help required
+- the type of help required
+- any relevant risks
+- confidence based on available information
+
+Important rules:
+- use only information supported by the provided context
+- do not invent facts
+- do not assume missing information
+- do not create unsupported user profiles
+- do not infer long-term memories
+- do not provide advice unless explicitly requested
+- do not answer the user's conversation directly
+- do not generate a normal assistant reply
+- focus only on structured conversation understanding
+
+If information is unknown or unsupported, represent it according
+to the output format demonstrated in the training examples.
+
+Return only the requested structured output.
+"""
+
+
+# ============================================================
+# 4. TRAINING PARAMETERS
+# ============================================================
+
 MAX_SEQ_LENGTH = 1024
-PER_DEVICE_BATCH_SIZE = 2
-GRADIENT_ACCUMULATION_STEPS = 8
-EFFECTIVE_BATCH_SIZE = (
-    PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
-)
 
-# Balanced Continual Learning
+# L40S optimized
+PER_DEVICE_BATCH_SIZE = 4
+GRADIENT_ACCUMULATION_STEPS = 8
+
+# Conservative specialization
 LEARNING_RATE = 2e-5
 NUM_TRAIN_EPOCHS = 1
+
 WARMUP_RATIO = 0.05
-WEIGHT_DECAY = 0.01
 
-# Validation
-VALIDATION_SPLIT = 0.05
-
-# Logging / Checkpoints
-SAVE_STEPS = 500
+SAVE_STEPS = 250
 LOGGING_STEPS = 10
 SAVE_TOTAL_LIMIT = 2
 
 
-# =============================================================================
-# SYSTEM PROMPT
-# =============================================================================
+# ============================================================
+# 5. LoRA CONFIGURATION
+# Same architecture as V5B / V5C
+# ============================================================
 
-SYSTEM_PROMPT = """You are a helpful AI assistant.
+LORA_R = 16
+LORA_ALPHA = 32
+LORA_DROPOUT = 0.05
 
-Analyze the provided conversation according to the instruction.
-
-Use only information supported by the provided context.
-
-Return the requested output accurately and concisely."""
-
-
-# =============================================================================
-# REQUIRED V5D OUTPUT SCHEMA
-# =============================================================================
-
-REQUIRED_OUTPUT_FIELDS = {
-    "topic",
-    "user_situation",
-    "current_goal",
-    "current_issue",
-    "conversation_stage",
-    "help_required",
-    "help_type",
-    "risk_detection",
-    "confidence",
-}
-
-REQUIRED_RISK_FIELDS = {
-    "scam",
-    "threat",
-    "harassment",
-    "manipulation",
-}
+LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
 
 
-# =============================================================================
-# UTILITIES
-# =============================================================================
+# ============================================================
+# 6. PRECISION
+# ============================================================
 
-def print_section(title):
-    print("\n" + "=" * 90)
-    print(title)
-    print("=" * 90)
+if torch.cuda.is_bf16_supported():
+    COMPUTE_DTYPE = torch.bfloat16
+    USE_BF16 = True
+    USE_FP16 = False
+else:
+    COMPUTE_DTYPE = torch.float16
+    USE_BF16 = False
+    USE_FP16 = True
+
+print("Compute dtype:", COMPUTE_DTYPE)
+print()
 
 
-def set_seed(seed):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+# ============================================================
+# 7. CHECK FILES
+# ============================================================
+
+print("=" * 80)
+print("CHECKING FILES")
+print("=" * 80)
+print()
+
+print("V5C base model:", os.path.abspath(BASE_CHECKPOINT))
+print("V5D dataset:", os.path.abspath(V5D_DATASET))
+print("Output directory:", os.path.abspath(OUTPUT_DIR))
+print()
+
+if not os.path.isdir(BASE_CHECKPOINT):
+    raise FileNotFoundError(
+        "V5C merged model was not found:\n"
+        + os.path.abspath(BASE_CHECKPOINT)
+    )
+
+if not os.path.isfile(V5D_DATASET):
+    raise FileNotFoundError(
+        "V5D dataset was not found:\n"
+        + os.path.abspath(V5D_DATASET)
+    )
 
 
-def dump_json(value):
-    """Serialize non-string values into compact JSON."""
-    if isinstance(value, str):
-        return value
+# ============================================================
+# 8. VERIFY V5C IS A MERGED MODEL
+# ============================================================
 
+print("=" * 80)
+print("CHECKING V5C MODEL")
+print("=" * 80)
+print()
+
+v5c_adapter_config = os.path.join(
+    BASE_CHECKPOINT,
+    "adapter_config.json",
+)
+
+if os.path.exists(v5c_adapter_config):
+    print("WARNING:")
+    print("adapter_config.json exists in the V5C directory.")
+    print("Make sure this is the MERGED V5C model.")
+    print("Do not use the V5C LoRA adapter directory.")
+else:
+    print("V5C appears to be a normal/merged model directory.")
+
+print()
+
+
+# ============================================================
+# 9. LOAD TOKENIZER
+# ============================================================
+
+print("=" * 80)
+print("LOADING V5C TOKENIZER")
+print("=" * 80)
+print()
+
+tokenizer = AutoTokenizer.from_pretrained(
+    BASE_CHECKPOINT,
+    trust_remote_code=True,
+)
+
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+tokenizer.padding_side = "right"
+
+print("Tokenizer loaded.")
+print()
+
+
+# ============================================================
+# 10. LOAD V5C MODEL
+# ============================================================
+
+print("=" * 80)
+print("LOADING V5C MODEL")
+print("=" * 80)
+print()
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=COMPUTE_DTYPE,
+    bnb_4bit_use_double_quant=True,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    BASE_CHECKPOINT,
+    quantization_config=bnb_config,
+    device_map="auto",
+    trust_remote_code=True,
+    attn_implementation="sdpa",
+)
+
+model.config.use_cache = False
+model.gradient_checkpointing_enable()
+
+model = prepare_model_for_kbit_training(model)
+
+print("V5C model loaded.")
+print()
+
+
+# ============================================================
+# 11. LoRA CONFIGURATION
+# ============================================================
+
+print("=" * 80)
+print("CONFIGURING V5D LoRA")
+print("=" * 80)
+print()
+
+peft_config = LoraConfig(
+    r=LORA_R,
+    lora_alpha=LORA_ALPHA,
+    lora_dropout=LORA_DROPOUT,
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=LORA_TARGET_MODULES,
+)
+
+print("LoRA rank:", LORA_R)
+print("LoRA alpha:", LORA_ALPHA)
+print()
+
+
+# ============================================================
+# 12. LOAD V5D DATASET
+# ============================================================
+
+print("=" * 80)
+print("LOADING V5D DATASET")
+print("=" * 80)
+print()
+
+raw_dataset = Dataset.from_json(V5D_DATASET)
+
+print(f"V5D samples: {len(raw_dataset):,}")
+print()
+
+if len(raw_dataset) == 0:
+    raise ValueError("V5D dataset is empty.")
+
+
+# ============================================================
+# 13. VALIDATE DATASET
+# ============================================================
+
+print("=" * 80)
+print("VALIDATING V5D DATASET")
+print("=" * 80)
+print()
+
+for index, example in enumerate(raw_dataset):
+
+    if "input" not in example:
+        raise ValueError(
+            f"Example {index + 1} missing 'input'."
+        )
+
+    if "output" not in example:
+        raise ValueError(
+            f"Example {index + 1} missing 'output'."
+        )
+
+    if not isinstance(example["input"], dict):
+        raise ValueError(
+            f"Example {index + 1}: 'input' must be a JSON object."
+        )
+
+    if not isinstance(example["output"], dict):
+        raise ValueError(
+            f"Example {index + 1}: 'output' must be a JSON object."
+        )
+
+print("Dataset validation passed.")
+print()
+
+
+# ============================================================
+# 14. JSON SERIALIZATION
+# ============================================================
+
+def dump_json(data):
     return json.dumps(
-        value,
+        data,
         ensure_ascii=False,
         separators=(",", ":"),
     )
 
 
-# =============================================================================
-# DATASET VALIDATION
-# =============================================================================
+# ============================================================
+# 15. FORMAT SAMPLE
+# SAME CHAT PIPELINE AS V5B / V5C
+# ============================================================
 
-def validate_record(item, line_number):
-    """Validate one V5D dataset record."""
+def format_sample(example):
 
-    # Top-level validation
-    if not isinstance(item, dict):
-        raise ValueError(
-            f"Line {line_number}: Record must be a JSON object."
+    instruction = str(
+        example.get(
+            "instruction",
+            "Analyze the conversation and extract structured understanding.",
         )
+    ).strip()
 
-    required_keys = {"instruction", "input", "output"}
-    missing = required_keys - set(item.keys())
+    input_data = example.get("input", {})
+    output_data = example.get("output", {})
 
-    if missing:
-        raise ValueError(
-            f"Line {line_number}: Missing keys: {missing}"
-        )
+    # Keep successful V5B/V5C style:
+    # Input -> Instruction
 
-    # Input validation
-    input_data = item["input"]
+    user_content = (
+        "Input:\n"
+        + dump_json(input_data)
+        + "\n\n"
+        + "Instruction:\n"
+        + instruction
+    )
 
-    if not isinstance(input_data, dict):
-        raise ValueError(
-            f"Line {line_number}: input must be an object."
-        )
+    assistant_content = dump_json(output_data)
 
-    required_input = {
-        "relationship",
-        "conversation",
-        "conversation_summary",
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        },
+        {
+            "role": "user",
+            "content": user_content,
+        },
+        {
+            "role": "assistant",
+            "content": assistant_content,
+        },
+    ]
+
+    formatted_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+
+    return {
+        "text": formatted_text,
     }
 
-    missing_input = required_input - set(input_data.keys())
 
-    if missing_input:
-        raise ValueError(
-            f"Line {line_number}: "
-            f"Missing input fields: {missing_input}"
-        )
+# ============================================================
+# 16. FORMAT DATASET
+# ============================================================
 
-    # Output validation
-    output = item["output"]
+print("=" * 80)
+print("FORMATTING V5D DATASET")
+print("=" * 80)
+print()
 
-    if not isinstance(output, dict):
-        raise ValueError(
-            f"Line {line_number}: output must be an object."
-        )
+formatted_dataset = raw_dataset.map(
+    format_sample,
+    remove_columns=raw_dataset.column_names,
+    desc="Formatting V5D dataset",
+)
 
-    missing_output = REQUIRED_OUTPUT_FIELDS - set(output.keys())
+print(
+    "Formatted samples:",
+    len(formatted_dataset),
+)
 
-    if missing_output:
-        raise ValueError(
-            f"Line {line_number}: "
-            f"Missing output fields: {missing_output}"
-        )
+print()
 
-    # help_required validation
-    if not isinstance(output["help_required"], bool):
-        raise ValueError(
-            f"Line {line_number}: help_required must be boolean."
-        )
+if len(formatted_dataset) == 0:
+    raise ValueError(
+        "No valid formatted samples remain."
+    )
 
-    # Risk detection validation
-    risk = output["risk_detection"]
 
-    if not isinstance(risk, dict):
-        raise ValueError(
-            f"Line {line_number}: "
-            f"risk_detection must be an object."
-        )
+# ============================================================
+# 17. SAVE NORMALIZED DATASET
+# ============================================================
 
-    missing_risk = REQUIRED_RISK_FIELDS - set(risk.keys())
+print("=" * 80)
+print("SAVING NORMALIZED DATASET")
+print("=" * 80)
+print()
 
-    if missing_risk:
-        raise ValueError(
-            f"Line {line_number}: "
-            f"Missing risk fields: {missing_risk}"
-        )
+with open(
+    NORMALIZED_DATASET,
+    "w",
+    encoding="utf-8",
+) as f:
 
-    for field in REQUIRED_RISK_FIELDS:
-        if not isinstance(risk[field], bool):
-            raise ValueError(
-                f"Line {line_number}: "
-                f"risk_detection.{field} must be boolean."
+    for example in formatted_dataset:
+        f.write(
+            json.dumps(
+                example,
+                ensure_ascii=False,
             )
-
-    # Confidence validation
-    confidence = output["confidence"]
-
-    if not isinstance(confidence, (int, float)):
-        raise ValueError(
-            f"Line {line_number}: confidence must be numeric."
+            + "\n"
         )
 
-    if not 0.0 <= confidence <= 1.0:
-        raise ValueError(
-            f"Line {line_number}: "
-            f"confidence must be between 0 and 1."
-        )
+print(
+    "Saved:",
+    os.path.abspath(NORMALIZED_DATASET),
+)
+
+print()
 
 
-# =============================================================================
-# DATA LOADING
-# =============================================================================
+# ============================================================
+# 18. DATASET STATISTICS
+# ============================================================
 
-def load_records(dataset_path):
-    """Load and validate JSONL dataset."""
+print("=" * 80)
+print("V5D DATASET STATISTICS")
+print("=" * 80)
+print()
 
-    print_section("LOADING AND VALIDATING V5D DATASET")
+dataset_size = len(formatted_dataset)
+sample_size = min(1000, dataset_size)
 
-    records = []
+token_lengths = []
+over_max_length = 0
 
-    with open(
-        dataset_path,
-        "r",
-        encoding="utf-8",
-    ) as file:
+for i in range(sample_size):
 
-        for line_number, line in enumerate(file, start=1):
-            if not line.strip():
-                continue
+    text = formatted_dataset[i]["text"]
 
-            try:
-                item = json.loads(line)
-
-            except json.JSONDecodeError as error:
-                raise ValueError(
-                    f"Invalid JSON at line "
-                    f"{line_number}: {error}"
-                )
-
-            validate_record(item, line_number)
-            records.append(item)
-
-    if not records:
-        raise ValueError("V5D dataset is empty.")
-
-    print(f"Validated V5D samples: {len(records)}")
-
-    if len(records) < 10_000:
-        print("Dataset size: Small")
-    elif len(records) < 60_000:
-        print("Dataset size: Medium")
-    else:
-        print("Dataset size: Large")
-
-    return records
-
-
-# =============================================================================
-# TOKENIZATION
-# =============================================================================
-
-def build_tokenized_dataset(records, tokenizer):
-    """
-    Build tokenized records with assistant-only loss.
-
-    Prompt tokens → label = -100
-    Assistant tokens → label = actual token ID
-    """
-
-    print_section("TOKENIZING DATASET")
-
-    tokenized_records = []
-    normalized_records = []
-
-    for index, item in enumerate(records, start=1):
-
-        # ---------------------------------------------------------------------
-        # User Content
-        # ---------------------------------------------------------------------
-
-        user_content = (
-            f"Instruction:\n{item['instruction']}\n\n"
-            f"Input:\n{dump_json(item['input'])}"
-        )
-
-        assistant_content = dump_json(item["output"])
-
-        # ---------------------------------------------------------------------
-        # Chat Messages
-        # ---------------------------------------------------------------------
-
-        prompt_messages = [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": user_content,
-            },
-        ]
-
-        full_messages = [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": user_content,
-            },
-            {
-                "role": "assistant",
-                "content": assistant_content,
-            },
-        ]
-
-        # ---------------------------------------------------------------------
-        # Apply Model Chat Template
-        # ---------------------------------------------------------------------
-
-        if getattr(tokenizer, "chat_template", None):
-
-            prompt_text = tokenizer.apply_chat_template(
-                prompt_messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-
-            full_text = tokenizer.apply_chat_template(
-                full_messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-
-        else:
-            prompt_text = (
-                f"### System:\n"
-                f"{SYSTEM_PROMPT}\n\n"
-                f"### User:\n"
-                f"{user_content}\n\n"
-                f"### Assistant:\n"
-            )
-
-            full_text = prompt_text + assistant_content
-
-        # ---------------------------------------------------------------------
-        # Tokenization
-        # ---------------------------------------------------------------------
-
-        full_encoding = tokenizer(
-            full_text,
-            truncation=True,
-            max_length=MAX_SEQ_LENGTH,
-            add_special_tokens=False,
-        )
-
-        prompt_encoding = tokenizer(
-            prompt_text,
-            truncation=True,
-            max_length=MAX_SEQ_LENGTH,
-            add_special_tokens=False,
-        )
-
-        input_ids = full_encoding["input_ids"]
-
-        # ---------------------------------------------------------------------
-        # Assistant-Only Labels
-        # ---------------------------------------------------------------------
-
-        prompt_length = min(
-            len(prompt_encoding["input_ids"]),
-            len(input_ids),
-        )
-
-        labels = input_ids.copy()
-
-        for token_index in range(prompt_length):
-            labels[token_index] = -100
-
-        assistant_tokens = sum(
-            label != -100
-            for label in labels
-        )
-
-        # Skip samples where truncation removed almost all output
-        if assistant_tokens < 5:
-            continue
-
-        # ---------------------------------------------------------------------
-        # Save Tokenized Record
-        # ---------------------------------------------------------------------
-
-        tokenized_records.append({
-            "input_ids": input_ids,
-            "attention_mask": full_encoding["attention_mask"],
-            "labels": labels,
-        })
-
-        normalized_records.append({
-            "prompt": prompt_text,
-            "completion": assistant_content,
-        })
-
-        if index % 10_000 == 0:
-            print(f"Processed {index:,} samples...")
-
-    if not tokenized_records:
-        raise ValueError(
-            "No valid tokenized samples remain."
-        )
-
-    print(
-        f"Final training samples: "
-        f"{len(tokenized_records):,}"
+    tokens = tokenizer.encode(
+        text,
+        add_special_tokens=False,
     )
 
-    return tokenized_records, normalized_records
+    token_length = len(tokens)
+
+    token_lengths.append(token_length)
+
+    if token_length > MAX_SEQ_LENGTH:
+        over_max_length += 1
 
 
-# =============================================================================
-# SAVE NORMALIZED DATASET
-# =============================================================================
+if token_lengths:
+    average_length = (
+        sum(token_lengths)
+        / len(token_lengths)
+    )
+    maximum_length = max(token_lengths)
+    minimum_length = min(token_lengths)
+else:
+    average_length = 0
+    maximum_length = 0
+    minimum_length = 0
 
-def save_normalized_dataset(records, output_path):
-    """Save readable prompt/completion dataset."""
 
-    print("\nSaving normalized dataset...")
+print(f"Dataset size         : {dataset_size:,}")
+print(f"Statistics sample    : {sample_size:,}")
+print(f"Minimum token length : {minimum_length}")
+print(f"Average token length : {average_length:.2f}")
+print(f"Maximum token length : {maximum_length}")
+print(
+    f"Over {MAX_SEQ_LENGTH} tokens "
+    f"(sample) : {over_max_length:,}"
+)
 
-    os.makedirs(
-        os.path.dirname(output_path),
-        exist_ok=True,
+print()
+
+
+# ============================================================
+# 19. TRAINING CONFIGURATION
+# ============================================================
+
+print("=" * 80)
+print("CREATING V5D TRAINING CONFIGURATION")
+print("=" * 80)
+print()
+
+training_args = SFTConfig(
+
+    output_dir=OUTPUT_DIR,
+
+    # Batch
+    per_device_train_batch_size=PER_DEVICE_BATCH_SIZE,
+    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+
+    # Sequence
+    max_length=MAX_SEQ_LENGTH,
+    dataset_text_field="text",
+    packing=False,
+
+    # Learning
+    learning_rate=LEARNING_RATE,
+    num_train_epochs=NUM_TRAIN_EPOCHS,
+    lr_scheduler_type="cosine",
+    warmup_ratio=WARMUP_RATIO,
+
+    # Optimizer
+    optim="paged_adamw_8bit",
+
+    # Precision
+    bf16=USE_BF16,
+    fp16=USE_FP16,
+    tf32=True,
+
+    # Gradient checkpointing
+    gradient_checkpointing=True,
+
+    # Logging
+    logging_steps=LOGGING_STEPS,
+
+    # Checkpoints
+    save_strategy="steps",
+    save_steps=SAVE_STEPS,
+    save_total_limit=SAVE_TOTAL_LIMIT,
+
+    # Misc
+    report_to="none",
+    disable_tqdm=False,
+)
+
+
+# ============================================================
+# 20. CREATE SFT TRAINER
+# ============================================================
+
+print("=" * 80)
+print("CREATING V5D SFT TRAINER")
+print("=" * 80)
+print()
+
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=formatted_dataset,
+    args=training_args,
+    peft_config=peft_config,
+    processing_class=tokenizer,
+)
+
+print("V5D SFTTrainer created.")
+print()
+
+
+# ============================================================
+# 21. TRAINABLE PARAMETERS
+# ============================================================
+
+print("=" * 80)
+print("TRAINABLE PARAMETERS")
+print("=" * 80)
+print()
+
+trainer.model.print_trainable_parameters()
+
+print()
+
+
+# ============================================================
+# 22. CHECK FOR EXISTING CHECKPOINT
+# ============================================================
+
+print("=" * 80)
+print("CHECKING FOR EXISTING V5D CHECKPOINT")
+print("=" * 80)
+print()
+
+last_checkpoint = None
+
+if os.path.isdir(OUTPUT_DIR):
+    last_checkpoint = trainer_utils.get_last_checkpoint(
+        OUTPUT_DIR
     )
 
-    with open(
-        output_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
 
-        for record in records:
-            file.write(
-                json.dumps(
-                    record,
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-
-    print(
-        "Normalized dataset saved:"
-    )
-    print(os.path.abspath(output_path))
-
-
-# =============================================================================
-# MAIN
-# =============================================================================
-
-def main():
-
-    # =========================================================================
-    # REPRODUCIBILITY
-    # =========================================================================
-
-    set_seed(SEED)
-
-    # =========================================================================
-    # CUDA VALIDATION
-    # =========================================================================
-
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA GPU was not detected."
-        )
-
-    print_section("COMPATIFI V5D TRAINING")
-    print("Balanced Continual Learning")
-
-    gpu_name = torch.cuda.get_device_name(0)
-    gpu_properties = torch.cuda.get_device_properties(0)
-    gpu_memory_gb = (
-        gpu_properties.total_memory / 1024 ** 3
-    )
-
-    print(f"GPU:  {gpu_name}")
-    print(f"VRAM: {gpu_memory_gb:.2f} GB")
-
-    # =========================================================================
-    # PATH VALIDATION
-    # =========================================================================
-
-    if not os.path.exists(BASE_CHECKPOINT):
-        raise FileNotFoundError(
-            f"\nBase checkpoint not found:\n"
-            f"{os.path.abspath(BASE_CHECKPOINT)}"
-        )
-
-    if not os.path.isfile(V5D_DATASET):
-        raise FileNotFoundError(
-            f"\nV5D dataset not found:\n"
-            f"{os.path.abspath(V5D_DATASET)}"
-        )
-
-    print("\nBase Model:")
-    print(os.path.abspath(BASE_CHECKPOINT))
-
-    print("\nDataset:")
-    print(os.path.abspath(V5D_DATASET))
-
-    # =========================================================================
-    # PRECISION
-    # =========================================================================
-
-    USE_BF16 = torch.cuda.is_bf16_supported()
-
-    if not USE_BF16:
-        raise RuntimeError(
-            "BF16 support was expected but not detected."
-        )
-
-    compute_dtype = torch.bfloat16
-    print("\nPrecision: BF16")
-
-    # =========================================================================
-    # LOAD TOKENIZER
-    # =========================================================================
-
-    print_section("LOADING TOKENIZER")
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        BASE_CHECKPOINT,
-        trust_remote_code=True,
-    )
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    tokenizer.padding_side = "right"
-
-    print("Tokenizer loaded.")
-
-    # =========================================================================
-    # QLORA CONFIGURATION
-    # =========================================================================
-
-    print_section("CONFIGURING QLORA")
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=compute_dtype,
-        bnb_4bit_use_double_quant=True,
-    )
-
-    # =========================================================================
-    # LOAD V5C MERGED BASE MODEL
-    # =========================================================================
-
-    print_section("LOADING V5C FINAL MERGED MODEL")
-
-    model = AutoModelForCausalLM.from_pretrained(
-        BASE_CHECKPOINT,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-
-    model.config.use_cache = False
-
-    print("V5C merged model loaded.")
-
-    # =========================================================================
-    # PREPARE FOR QLORA
-    # =========================================================================
-
-    print("\nPreparing model for QLoRA training...")
-
-    model = prepare_model_for_kbit_training(
-        model,
-        use_gradient_checkpointing=True,
-    )
-
-    # =========================================================================
-    # LORA CONFIGURATION
-    # =========================================================================
-
-    print_section("CONFIGURING BALANCED LORA")
-
-    peft_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-
-        # Attention + MLP adaptation
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
-    )
-
-    model = get_peft_model(
-        model,
-        peft_config,
-    )
-
-    print("Balanced LoRA configured.")
-
-    # =========================================================================
-    # LOAD DATASET
-    # =========================================================================
-
-    records = load_records(V5D_DATASET)
-
-    # =========================================================================
-    # TOKENIZE DATASET
-    # =========================================================================
-
-    tokenized_records, normalized_records = (
-        build_tokenized_dataset(
-            records,
-            tokenizer,
-        )
-    )
-
-    # =========================================================================
-    # SAVE NORMALIZED DATASET
-    # =========================================================================
-
-    save_normalized_dataset(
-        normalized_records,
-        NORMALIZED_DATASET,
-    )
-
-    # =========================================================================
-    # CREATE HF DATASET
-    # =========================================================================
-
-    full_dataset = Dataset.from_list(
-        tokenized_records
-    )
-
-    # =========================================================================
-    # TRAIN / VALIDATION SPLIT
-    # =========================================================================
-
-    print_section(
-        "CREATING TRAIN / VALIDATION SPLIT"
-    )
-
-    dataset_split = full_dataset.train_test_split(
-        test_size=VALIDATION_SPLIT,
-        seed=SEED,
-        shuffle=True,
-    )
-
-    train_dataset = dataset_split["train"]
-    eval_dataset = dataset_split["test"]
-
-    print(
-        f"Training samples:   {len(train_dataset):,}"
-    )
-    print(
-        f"Validation samples: {len(eval_dataset):,}"
-    )
-
-    # =========================================================================
-    # DATA COLLATOR
-    # =========================================================================
-
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        model=model,
-        padding=True,
-        label_pad_token_id=-100,
-        pad_to_multiple_of=8,
-    )
-
-    # =========================================================================
-    # TRAINING ARGUMENTS
-    # =========================================================================
-
-    print_section("CONFIGURING TRAINING")
-
-    training_args = TrainingArguments(
-        output_dir=OUTPUT_DIR,
-
-        # Batch
-        per_device_train_batch_size=PER_DEVICE_BATCH_SIZE,
-        per_device_eval_batch_size=PER_DEVICE_BATCH_SIZE,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-
-        # Learning
-        learning_rate=LEARNING_RATE,
-        num_train_epochs=NUM_TRAIN_EPOCHS,
-        lr_scheduler_type="cosine",
-        warmup_ratio=WARMUP_RATIO,
-        weight_decay=WEIGHT_DECAY,
-
-        # Optimizer
-        optim="paged_adamw_8bit",
-
-        # Precision
-        bf16=True,
-        fp16=False,
-        tf32=True,
-
-        # Memory
-        gradient_checkpointing=True,
-
-        # Evaluation
-        eval_strategy="steps",
-        eval_steps=SAVE_STEPS,
-
-        # Checkpointing
-        save_strategy="steps",
-        save_steps=SAVE_STEPS,
-        save_total_limit=SAVE_TOTAL_LIMIT,
-
-        # Best Model
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-
-        # Logging
-        logging_steps=LOGGING_STEPS,
-        report_to="none",
-        disable_tqdm=False,
-
-        # Dataset
-        remove_unused_columns=False,
-
-        # Reproducibility
-        seed=SEED,
-    )
-
-    # =========================================================================
-    # TRAINER
-    # =========================================================================
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=data_collator,
-        callbacks=[
-            EarlyStoppingCallback(
-                early_stopping_patience=3,
-                early_stopping_threshold=0.001,
-            )
-        ],
-    )
-
-    # =========================================================================
-    # TRAINING SUMMARY
-    # =========================================================================
-
-    print_section(
-        "BALANCED CONTINUAL LEARNING CONFIGURATION"
-    )
-
-    trainer.model.print_trainable_parameters()
-
-    print(f"\nBase Model: V5C Final Merged Model")
-    print(f"Learning Rate: {LEARNING_RATE}")
-    print(f"Epochs: {NUM_TRAIN_EPOCHS}")
-    print(f"Effective Batch Size: {EFFECTIVE_BATCH_SIZE}")
-    print(f"LoRA Rank: {peft_config.r}")
-    print(f"LoRA Alpha: {peft_config.lora_alpha}")
-    print("LoRA Targets: Attention + MLP projections")
-    print("Assistant-only loss: Enabled")
-    print(f"Validation Split: {VALIDATION_SPLIT * 100}%")
-    print("Best Checkpoint Restoration: Enabled")
-    print("Early Stopping: Enabled")
-
-    # =========================================================================
-    # CHECKPOINT DETECTION
-    # =========================================================================
-
-    last_checkpoint = None
-
-    if os.path.isdir(OUTPUT_DIR):
-        last_checkpoint = get_last_checkpoint(
-            OUTPUT_DIR
-        )
-
-    print(
-        "\nPrevious checkpoint:",
-        last_checkpoint or "None",
-    )
-
-    # =========================================================================
-    # TRAIN
-    # =========================================================================
-
-    print_section("STARTING V5D TRAINING")
-
+if last_checkpoint:
+
+    print("Checkpoint found:")
+    print(os.path.abspath(last_checkpoint))
+    print()
+    print("Training will RESUME.")
+
+else:
+
+    print("No checkpoint found.")
+    print("Starting fresh V5D training from V5C.")
+
+print()
+
+
+# ============================================================
+# 23. FINAL CONFIGURATION DISPLAY
+# ============================================================
+
+print("=" * 80)
+print("V5D TRAINING CONFIGURATION")
+print("=" * 80)
+print()
+
+print("Base model       :", BASE_CHECKPOINT)
+print("Training dataset :", V5D_DATASET)
+print("Training samples :", f"{len(formatted_dataset):,}")
+print("Epochs           :", NUM_TRAIN_EPOCHS)
+print("Batch size       :", PER_DEVICE_BATCH_SIZE)
+print("Gradient accum.  :", GRADIENT_ACCUMULATION_STEPS)
+print("Learning rate    :", LEARNING_RATE)
+print("Max sequence     :", MAX_SEQ_LENGTH)
+print("Save steps       :", SAVE_STEPS)
+print()
+print("Trainer          : SFTTrainer")
+print("Training style   : Full formatted chat sequence")
+print("Manual masking   : NONE")
+print("Replay dataset   : NONE")
+print()
+print("Architecture consistency:")
+print("V5B -> SFTTrainer")
+print("V5C -> SFTTrainer")
+print("V5D -> SFTTrainer")
+print()
+
+
+# ============================================================
+# 24. START TRAINING
+# ============================================================
+
+print("=" * 80)
+print("STARTING V5D TRAINING")
+print("=" * 80)
+print()
+
+if last_checkpoint:
     trainer.train(
         resume_from_checkpoint=last_checkpoint
     )
-
-    # =========================================================================
-    # FINAL EVALUATION
-    # =========================================================================
-
-    print_section("FINAL VALIDATION")
-
-    final_metrics = trainer.evaluate()
-
-    print("\nFinal evaluation results:")
-
-    for key, value in final_metrics.items():
-        print(f"{key}: {value}")
-
-    # =========================================================================
-    # SAVE FINAL ADAPTER
-    # =========================================================================
-
-    print_section("SAVING FINAL V5D ADAPTER")
-
-    os.makedirs(
-        FINAL_MODEL_DIR,
-        exist_ok=True,
-    )
-
-    trainer.save_model(
-        FINAL_MODEL_DIR
-    )
-
-    tokenizer.save_pretrained(
-        FINAL_MODEL_DIR
-    )
-
-    print("\nFinal V5D adapter saved:")
-    print(
-        os.path.abspath(
-            FINAL_MODEL_DIR
-        )
-    )
-
-    # =========================================================================
-    # COMPLETE
-    # =========================================================================
-
-    print_section("V5D TRAINING COMPLETE")
-
-    print("""
-Pipeline:
-V5A Knowledge
-    ↓
-V5B Knowledge
-    ↓
-V5C Knowledge
-    ↓
-V5C Final Merged Model
-    ↓
-Balanced V5D QLoRA
-    ↓
-V5D Final Adapter
-
-Training Design:
-✓ Previous V5C merged model as frozen base
-✓ 4-bit NF4 QLoRA
-✓ BF16 training
-✓ Learning rate = 2e-5
-✓ 1 epoch
-✓ LoRA rank = 16
-✓ LoRA alpha = 32
-✓ Attention + MLP LoRA
-✓ Assistant-only loss
-✓ Validation monitoring
-✓ Best checkpoint restoration
-✓ Early stopping
-✓ Gradient checkpointing
-
-Goal:
-Learn V5D Conversation Understanding strongly while minimizing
-unnecessary drift from V5A/V5B/V5C capabilities.
-""")
+else:
+    trainer.train()
 
 
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
+# ============================================================
+# 25. SAVE FINAL V5D MODEL
+# ============================================================
 
-if __name__ == "__main__":
-    main()
+FINAL_MODEL_DIR = os.path.join(
+    OUTPUT_DIR,
+    "final_model",
+)
+
+print()
+print("=" * 80)
+print("SAVING FINAL V5D MODEL")
+print("=" * 80)
+print()
+
+trainer.save_model(FINAL_MODEL_DIR)
+tokenizer.save_pretrained(FINAL_MODEL_DIR)
+
+print()
+print("Final V5D model:")
+print(os.path.abspath(FINAL_MODEL_DIR))
+print()
+
+
+# ============================================================
+# 26. COMPLETE
+# ============================================================
+
+print("=" * 80)
+print("V5D TRAINING COMPLETE")
+print("=" * 80)
+print()
+
+print("Pipeline:")
+print("V4B -> V5A -> V5B -> V5C -> V5D")
+print()
+
+print("V5D task:")
+print("Conversation -> Structured Understanding")
+print()
+
+print("Training architecture:")
+print("QLoRA + SFTTrainer")
+print()
+
+print("Replay dataset: NONE")
+print()
+
+print("Final model:")
+print(os.path.abspath(FINAL_MODEL_DIR))
+print()
+
+print("=" * 80)
+print("DONE")
+print("=" * 80)
